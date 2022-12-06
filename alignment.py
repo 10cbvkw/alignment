@@ -5,7 +5,7 @@ import pose_search
 
 import numpy as np
 import scipy
-from skimage.transform import resize
+import cv2
 
 import scipy.io as scio
 import matplotlib.pyplot as plt
@@ -23,9 +23,11 @@ R_img = img_plt[:, :, 0]
 G_img = img_plt[:, :, 1]
 B_img = img_plt[:, :, 2]
 
-image = resize(R_img, output_shape=(256, 256))
+image = cv2.resize(R_img, (256, 256))
 plt.imshow(image)
 plt.show()
 
-bast_rot, bast_trans = pose_search.opt_theta_trans(recondata_cut, R_img)
-bast_rot, bast_trans = pose_search.opt_theta_trans(fluorescenceCA1, R_img)
+bast_rot, bast_trans = pose_search.opt_theta_trans(recondata_cut, image)
+bast_rot, bast_trans = pose_search.opt_theta_trans(fluorescenceCA1, image)
+
+# FIXME scale of volume and image do not match

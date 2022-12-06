@@ -1,5 +1,6 @@
 import numpy as np
-import scipy
+from scipy import ndimage
+
 from scipy.spatial.transform import Rotation as R
 import sys
 
@@ -35,10 +36,10 @@ base_quat = (so3_grid.s2_grid_SO3(base_healpy) if FAST_INPLANE else so3_base_qua
 r = R.from_quat(so3_base_quat)
 so3_base_rot = r.as_matrix()
 r = R.from_quat(base_quat)
-base_rot = r.as_matrix()
+base_r = r.as_matrix()
 nbase = len(base_quat)
 base_inplane = so3_grid.grid_s1(base_healpy)
-base_shifts = shift_grid.base_shift_grid(base_healpy - 1, t_extent, t_ngrid, xshift=t_xshift, yshift=t_yshift)
+base_s = shift_grid.base_shift_grid(base_healpy - 1, t_extent, t_ngrid, xshift=t_xshift, yshift=t_yshift)
 t_extent = t_extent
 t_ngrid = t_ngrid
 
@@ -62,24 +63,34 @@ def eval_grid(volume, images, rot, NQ, L):
     """
 
     # FIXME mask
+    nz = 1
 
-    def compute_err(volume, images, rot):
+    def compute_err(volume, images, rot, nz):
 
         """
         images: T x Npix
         rot: Q x 3 x 3 rotation matrics 
         """
-        err = np.zeros(256, images.shape[0], rot.shape[0])
+
+        err = np.zeros((256, images.shape[0], rot.shape[0]))
         volume = volume.transpose(2, 0, 1)
         volume_rotated = rotate3D_scipy.generalTransform(volume, 128, 128, 128, rot, method='linear')
         for z_dim in range(256):
             y_hat = volume_rotated[z_dim, :, :] 
             err[z_dim] = -(images * y_hat).sum(-1) / y_hat.std(-1)
-
-        return err
         
-    err = compute_err(volume ,images, rot)
-    return err  # 256xTxQ
+        err_z = []
+        for z_dim in range(256):
+            err_z.append(err[z_dim].sum())
+
+        value = max(err_z)
+        keepz = err_z.index(value)
+        
+        return err[keepz], keepz
+
+        
+    err, keepz = compute_err(volume ,images, rot, nz)
+    return err, keepz  # nzxTxQ
 
 def mask_image(image, L): # checked
 
@@ -108,13 +119,12 @@ def translate_image(image, shifts, L): # checked
     shift: N * 2 numpy.array
     Return: NY x NX translated at resolution L numpy.array
     """
-
     N = shifts.shape[0]
     D = image.shape[0]
     images = np.zeros((N, D, D))
     iter = 0
     for shift in shifts:
-        new_image = scipy.ndimage.shift(input = image, shift = shift)
+        new_image = ndimage.shift(input = image, shift = shift)
 
         mask = np.zeros((D, D))
         for i in range(D):
@@ -141,7 +151,7 @@ def rotate_image(image, angle, L): # checked
     """
     
     D = image.shape[0]
-    new_image = scipy.ndimage.rotate(input = image, angle = angle)
+    new_image = ndimage.rotate(input = image, angle = angle)
 
     mask = np.zeros((D, D))
     for i in range(D):
@@ -245,20 +255,18 @@ def getL(iter_): # checked
 
 def opt_theta_trans(volume_, image):
     
-    base_rot = base_rot
-    base_shifts = base_shifts
+    base_rot = base_r
+    base_shifts = base_s
     
     # Compute the loss for all poses
     L = getL(0)
-    loss = eval_grid(
+    loss, keepz = eval_grid(
         volume=volume_,
-        images=translate_image(image, base_shifts, L), # FIXME can image be translated with multi_trans in this function?
+        images=translate_image(image, base_shifts, L), 
         rot=base_rot, 
         NQ=nbase, 
         L=L, 
         )
-
-    # FIXME loss(256, T, Q)选出256个中小的一个负相关的值
 
     keepT, keepQ = keep_matrix(loss, nkeptposes)
 
@@ -268,12 +276,13 @@ def opt_theta_trans(volume_, image):
     shifts = base_shifts
 
     for iter_ in range(1, niter + 1):
+        print(iter_)
         L = getL(iter_)
         quat, q_ind, rot = subdivide(quat, q_ind, iter_ + base_healpy - 1)
         shifts /= 2
         trans = trans + shifts
         rot = rot
-        loss = eval_grid(
+        loss, keepz = eval_grid(
             volume=volume_,
             images=translate_image(image, trans, L),  
             rot=rot,
@@ -296,5 +305,6 @@ def opt_theta_trans(volume_, image):
     else:
         best_rot = rot.reshape(8, 3, 3)[bestQ]
         best_trans = trans
+    best_z = keepz
 
-    return best_rot, best_trans
+    return best_rot, best_trans, best_z

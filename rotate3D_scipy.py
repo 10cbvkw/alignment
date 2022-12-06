@@ -29,7 +29,15 @@ def generalTransform(image, x_center, y_center, z_center, transform_matrix, meth
     z_valid1 = zz_prime>=0
     z_valid2 = zz_prime<=Nz-1
     valid_voxel = x_valid1 * x_valid2 * y_valid1 * y_valid2 * z_valid1 * z_valid2
-    z_valid_idx, y_valid_idx, x_valid_idx = numpy.where(valid_voxel > 0)
+    return_ = numpy.where(valid_voxel > 0)
+    print(valid_voxel.shape)
+    print(return_)
+    print(return_[0].shape)
+    print(return_[1].shape)
+    print(return_[2].shape)
+    print(return_[3].shape)
+    assert(0==1)
+    z_valid_idx, y_valid_idx, x_valid_idx = numpy.where(valid_voxel > 0) # FIXME too many values to unpack (expected 3)
     # interpolate using scipy RegularGridInterpolator
     image_transformed = numpy.zeros((Nz, Ny, Nx))
     data_w_coor = RegularGridInterpolator((z, y, x), image, method=method)
