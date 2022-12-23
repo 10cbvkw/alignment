@@ -1,12 +1,14 @@
 import numpy as np
+import os
 from scipy import ndimage
 
 from scipy.spatial.transform import Rotation as R
 import sys
+import torch
 
-sys.path.append(r'/Users/yez/desktop/alignment/')
+sys.path.append(r'/home/yez/alignment/')
+from scipy.interpolate import RegularGridInterpolator
 import shift_grid
-import rotate3D_scipy
 import so3_grid
 
 def rot_2d(angle, outD, device=None): # checked
@@ -22,9 +24,9 @@ Lmax = 128 # FIXME input parameters
 D = 256 # FIXME input parameters
 tilt = None
 base_healpy = 1
-t_extent = 5
+t_extent = 32
 t_ngrid = 7
-niter = 5
+niter = 10
 nkeptposes = 24
 loss_fn = "msf"
 t_xshift = 0
@@ -51,6 +53,7 @@ nkeptposes = nkeptposes
 loss_fn = loss_fn
 _so3_neighbor_cache = {}  # for memoization
 _shift_neighbor_cache = {}  # for memoization
+os.environ['CUDA_VISIBLE_DEVICE']='2'
 
 def eval_grid(volume, images, rot, NQ, L):
 
@@ -62,7 +65,6 @@ def eval_grid(volume, images, rot, NQ, L):
     L: radius of fourier components to evaluate
     """
 
-    # FIXME mask
     nz = 1
 
     def compute_err(volume, images, rot, nz):
@@ -71,24 +73,50 @@ def eval_grid(volume, images, rot, NQ, L):
         images: T x Npix
         rot: Q x 3 x 3 rotation matrics 
         """
-
-        err = np.zeros((256, images.shape[0], rot.shape[0]))
-        volume = volume.transpose(2, 0, 1)
-        volume_rotated = rotate3D_scipy.generalTransform(volume, 128, 128, 128, rot, method='linear')
-        for z_dim in range(256):
-            y_hat = volume_rotated[z_dim, :, :] 
-            err[z_dim] = -(images * y_hat).sum(-1) / y_hat.std(-1)
         
+        err = np.zeros((256, rot.shape[0], images.shape[0]))
+        x = np.linspace(-1, 1, 256, endpoint=True)
+        y = np.linspace(-1, 1, 256, endpoint=True)
+        z = np.linspace(-1, 1, 256, endpoint=True)
+        interp = RegularGridInterpolator((x, y, z), volume, method = 'linear')
+        # FIXME use cuda interp = RegularGridInterpolator((x, y, z), volume_, method = 'linear')
+        x0, x1, x2 = np.meshgrid(
+            np.linspace(-1, 1, 256, endpoint=True),
+            np.linspace(-1, 1, 256, endpoint=True),
+            np.linspace(-1, 1, 256, endpoint=True),)
+        coords = np.stack([x0.ravel(), x1.ravel(), x2.ravel()], 1).astype(np.float32)
+        rotated_coords = coords @ rot
+        rotated_coords = rotated_coords # to satisfy grid_sample
+        rotated_volume = np.zeros((rot.shape[0],256,256,256))
+
+        err = torch.from_numpy(err).cpu()
+        err = err.cuda()
+        volume_ = torch.from_numpy(volume)
+        volume_ = volume_.cuda()
+        volume_ = volume_.view(1,1,volume_.shape[0],volume_.shape[1],volume_.shape[2])
+        images = torch.from_numpy(images)
+        images = images.cuda()
+        for i in range(rotated_coords.shape[0]):
+            print(i)
+            grid = rotated_coords[i].reshape(1,1,1,rotated_coords.shape[1],rotated_coords.shape[2])
+            grid = torch.from_numpy(grid)
+            grid = grid.cuda()
+            interp_res = torch.nn.functional.grid_sample(volume_, grid, mode='bilinear', align_corners=True)
+            rotated_volume = interp_res.view(256,256,256)
+            rotated_volume = rotated_volume.permute(2,0,1)
+
+            for ind_ in range(images.shape[0]):
+                err[:, i, ind_] = -(images[ind_] * rotated_volume).mean(axis = [1,2], keepdim = False)
+
+        err = (err.cpu()).numpy()    
         err_z = []
         for z_dim in range(256):
-            err_z.append(err[z_dim].sum())
-
-        value = max(err_z)
+            err_z.append(err[z_dim].min())
+        value = min(err_z)
         keepz = err_z.index(value)
-        
+        print('keepz = ', keepz)
         return err[keepz], keepz
 
-        
     err, keepz = compute_err(volume ,images, rot, nz)
     return err, keepz  # nzxTxQ
 
@@ -119,6 +147,7 @@ def translate_image(image, shifts, L): # checked
     shift: N * 2 numpy.array
     Return: NY x NX translated at resolution L numpy.array
     """
+
     N = shifts.shape[0]
     D = image.shape[0]
     images = np.zeros((N, D, D))
@@ -139,6 +168,7 @@ def translate_image(image, shifts, L): # checked
         new_image = new_image - img
         images[iter] = new_image
         iter += 1
+
 
     return images
 
@@ -246,7 +276,10 @@ def keep_matrix(loss, max_poses): # checked
     keep_idx[1] = flat_idx
     keep_idx[0] = best_trans_idx[flat_idx]
     keep_idx = keep_idx.astype(int)
-
+    print('best_loss = ', best_loss)
+    print('best_trans_idx = ', best_trans_idx)
+    print('flat_idx = ', flat_idx)
+    print('keep_idx = ', keep_idx)
     return keep_idx
 
 def getL(iter_): # checked
@@ -257,6 +290,7 @@ def opt_theta_trans(volume_, image):
     
     base_rot = base_r
     base_shifts = base_s
+    nkeptposes = 8
     
     # Compute the loss for all poses
     L = getL(0)
@@ -267,9 +301,8 @@ def opt_theta_trans(volume_, image):
         NQ=nbase, 
         L=L, 
         )
-
+    
     keepT, keepQ = keep_matrix(loss, nkeptposes)
-
     quat = so3_base_quat[keepQ]
     q_ind = so3_grid.get_base_ind(keepQ, base_healpy) 
     trans = base_shifts[keepT]
@@ -279,8 +312,14 @@ def opt_theta_trans(volume_, image):
         print(iter_)
         L = getL(iter_)
         quat, q_ind, rot = subdivide(quat, q_ind, iter_ + base_healpy - 1)
+        quat = quat.reshape(-1,4)
+        q_ind = q_ind.reshape(-1,2)
         shifts /= 2
-        trans = trans + shifts
+        trans_ = np.zeros((trans.shape[0] * shifts.shape[0], 2))
+        for i in range(trans.shape[0]):
+            for j in range(shifts.shape[0]):
+                trans_[i * nkeptposes + j, :] = trans[i, :] + shifts[j, :]
+        trans = trans_
         rot = rot
         loss, keepz = eval_grid(
             volume=volume_,
@@ -289,11 +328,8 @@ def opt_theta_trans(volume_, image):
             NQ=8,
             L=L)
 
-        # FIXME loss(256, T, Q)选出256个中小的一个负相关的值
-
         nkeptposes = nkeptposes if iter_ < niter else 1
         keepT, keepQ = keep_matrix(loss, nkeptposes)
-
         quat = quat[keepQ]
         q_ind = q_ind[keepQ]
         trans = trans[keepT]
@@ -303,8 +339,7 @@ def opt_theta_trans(volume_, image):
         best_rot = so3_base_rot[bestQ]
         best_trans = base_shifts[bestT]
     else:
-        best_rot = rot.reshape(8, 3, 3)[bestQ]
+        best_rot = rot[bestQ].reshape(3, 3)
         best_trans = trans
     best_z = keepz
-
     return best_rot, best_trans, best_z
